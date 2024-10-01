@@ -1,0 +1,513 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2068
+
+#
+#Copyright 2024 Frank Stutz.
+#
+#Licensed under the Apache License, Version 2.0 (the "License");
+#you may not use this file except in compliance with the License.
+#You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+#Unless required by applicable law or agreed to in writing, software
+#distributed under the License is distributed on an "AS IS" BASIS,
+#WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#See the License for the specific language governing permissions and
+#limitations under the License.
+#
+
+#####################################
+# Sourcing of Common Include File
+#####################################
+COMMON_INCLUDE_FILE="include-common.sh"
+
+# shellcheck disable=SC2164
+ABSPATH="$(
+  cd "${0%/*}" 2>/dev/null
+  echo "$PWD"/"${0##*/}"
+)"
+BASEDIR="$(dirname "$ABSPATH")" && declare BASEDIR
+APPNAME="$(basename "$ABSPATH")" && declare APPNAME
+
+if [ -f "$BASEDIR/${COMMON_INCLUDE_FILE}" ]; then
+  # shellcheck disable=SC1090
+  source "$BASEDIR/${COMMON_INCLUDE_FILE}"
+elif [ -f "$HOME/opt/bin/${COMMON_INCLUDE_FILE}" ]; then
+  # shellcheck disable=SC1090
+  source "$HOME/opt/bin/${COMMON_INCLUDE_FILE}"
+else
+  echo "ERROR: Unable to source the common include file"
+  exit 1
+fi
+
+# Configuration Paramaters
+# shellcheck disable=SC2034
+declare DATELOG=false # Don't display ISO8601 in output
+# shellcheck disable=SC2034
+declare KEYFOMAT="SHORT"
+declare TEST=false
+
+#####################################
+# Function Section
+#####################################
+function update-default-key {
+  if [ -z "$1" ]; then
+    mlog ERROR "update-default-key requires a <key id or name of key>"
+    return 10
+  fi
+  declare key="$1"
+  shift
+  declare -a raw_keyids=()
+  if ! raw_keyids=("$(gpg --with-colons -k --with-fingerprint --with-fingerprint "$key" 2>/dev/null)"); then
+    mlog ERROR "Unable to find key for $key"
+    return 11
+  fi
+  mlog DEBUG "Raw_keyids ${raw_keyids[*]}"
+  declare -a keyids=()
+
+  if [ -n "$KEYFORMAT" ] && [ "$KEYFORMAT" == "LONG" ]; then
+    mlog VERBOSE "Fetching long fingerprint for the key"
+    # shellcheck disable=SC2016
+    AWK_CMD='$1=="pub" && $2=="u" { short=$5 }; $1=="fpr" { long=$10;  exit; } END { if (long ~ short) { print long } }'
+  else # Do Short (which is default for gpg)
+    mlog VERBOSE "Fetching short fingerprint for the key"
+    # shellcheck disable=SC2016
+    AWK_CMD='$1=="pub" && $2=="u" { printf "%s ", $5}'
+  fi
+
+  #  if ! keyids=("$(echo "${raw_keyids[*]}" 2>/dev/null | awk -F: '$1=="pub" && $2=="u" { printf "%s ", $5}' 2>/dev/null)"); then
+  #
+  if ! keyids=("$(echo "${raw_keyids[*]}" 2>/dev/null | awk -F: "$AWK_CMD" 2>/dev/null)"); then
+    mlog ERROR "Unable to determine public valid keyid for $key"
+    return 12
+  fi
+  mlog DEBUG "Keyids ${keyids[*]}"
+
+  declare keyid=''
+  case "${#keyids[@]}" in
+  0)
+    mlog ERROR "Unable to obtain valid key from local public keychain"
+    return 14
+    ;;
+  1)
+    keyid="${keyids[*]}"
+    mlog DEBUG "Key has fingerprint of $keyid"
+    ;;
+  *)
+    mlog ERROR "we need to present user with a mulitple choice for them to choose...not done"
+    return 15
+    ;;
+  esac
+
+  # shellcheck disable=SC2086
+  if ! out="$(gpgconf --change-options gpg 2>&1 < <(echo 'default-key:0:"'$keyid))"; then
+    mlog ERROR "Unable to set $key as default"
+    [[ -n "$out" ]] && mlog ERROR "$out"
+    return 16
+  fi
+  mlog SUCCESS "Successfully set $key as default key for gpg"
+}
+
+function cleanup {
+  declare exp_keys=()
+  mlog VERBOSE "Finding keys in gpg store that have expired"
+  if ! exp_keys=("$(gpg -k --with-colons 2>&1 | awk -F: '$1 == "pub" && ($2 == "e" || $2 == "r") { print $5 }' 2>&1)"); then
+    mlog ERROR "Error fetching expired keys"
+    if [[ ${#exp_keys[@]} -ge 1 && -n "${exp_keys[*]}" ]] && mlog ERROR "${exp_keys[*]}"; then
+      return 5
+    fi
+  fi
+
+  if [[ ${#exp_keys[@]} -le 0 || -z "${exp_keys[*]}" ]]; then
+    bcheck QUIET || mlog INFO "No expired keys to cleanup"
+    return 0
+  else
+    declare out=()
+    declare x='' failflag=false
+    if bcheck QUIET; then
+      # shellcheck disable=SC2207,SC2048,SC2086
+      if ! out=($(gpg --batch --yes --delete-keys ${exp_keys[*]} 2>&1)); then
+        mlog ERROR "Unable to deleted exipred keys ${exp_keys[*]}"
+        [[ ${#out[@]} -ge 1 && -n "${out[*]}" ]] && mlog ERROR "${out[*]}"
+        return 6
+      fi
+    else
+      #shellcheck disable=SC2068
+      for x in ${exp_keys[@]}; do
+        mlog INFO "Removing expired key $x"
+        # shellcheck disable=SC2207,SC2048,SC2086
+        if ! out=($(gpg --batch --yes --delete-keys $x 2>&1)); then
+          mlog ERROR "Failed to remove key $x"
+          [[ ${#out[@]} -ge 1 && -n "${out[*]}" ]] && mlog ERROR "${out[*]}"
+          failflag=true
+        fi
+      done
+      if $failflag; then
+        return 7
+      fi
+    fi
+  fi
+}
+
+function sync-backup {
+  if [ $# -lt 3 ]; then
+    mlog ERROR "Usage: fgpg sync <key file> <trustdb file> <host>"
+    return 21
+  fi
+  declare _KEY_FILE="$1"
+  shift
+  declare _TRUST_FILE="$1"
+  shift
+  declare _HOST="$1"
+  shift
+
+  mlog VERBOSE "Validating $_KEY_FILE is readable"
+  if ! [ -r "$_KEY_FILE" ]; then
+    mlog ERROR "$_KEY_FILE key file not found or not readable"
+    return 22
+  fi
+  mlog VERBOSE "Validation of $_KEY_FILE successfull"
+
+  mlog VERBOSE "Validating $_TRUST_FILE is readable"
+  if ! [ -r "$_TRUST_FILE" ]; then
+    mlog ERROR "$_TRUST_FILE trust file not found or not readable"
+    return 23
+  fi
+  mlog VERBOSE "Validation of $_TRUST_FILE successfull"
+
+  mlog VERBOSE "Validating connectivity to $_HOST"
+  if ! [[ "$(ssh-keyscan -4T 2 "$_HOST" 2>&1)" =~ $_HOST ]]; then
+    mlog ERROR "Validation of connectivity to $_HOST failed"
+    return 24
+  fi
+  mlog VERBOSE "Validation of connectivity to $_HOST successfull"
+
+  mlog VERBOSE "Determining UID from $_KEY_FILE for use in validation later"
+  if ! out=$(gpg --show-keys --with-subkey-fingerprint --with-colons "$_KEY_FILE" | awk -F: '$1=="uid" {printf $10; exit;}'); then
+    mlog ERROR "Unable to determine a uid in $_KEY_FILE"
+    return 25
+  fi
+  declare _UID="$out" # Used for validation later
+  mlog VERBOSE "Determined $_UID uid is found in $_KEY_FILE"
+
+  mlog VERBOSE "Validating $_HOST has gpg installed"
+  if ! out=$(ssh "$_HOST" 'gpg -k >/dev/null 2>&1 ; gpg --version > /dev/null 2>&1 ; echo -n $?') || [ "$out" -ne 0 ]; then
+    mlog ERROR "Unable to ssh to $_HOST or gpg --version is nost installed"
+    return 26
+  fi
+  mlog VERBOSE "Validation successfull as $_HOST has gpg installed "
+
+  mlog VERBOSE "Importing $_KEY_FILE into gpg store on $_HOST"
+  if ! out="$(ssh "$_HOST" 'gpg --import-options restore --import --batch' 2>&1 <"$_KEY_FILE")"; then
+    mlog ERROR "Unable to import $_KEY_FILE on $_HOST"
+    return 27
+  fi
+  [[ -n "$out" ]] && mlog VERBOSE "=-=-= Import Key Output =-=-=\n$out"
+
+  mlog VERBOSE "Importing $_TRUST_FILE into gpg ownertrust store on $_HOST"
+  if ! out="$(ssh "$_HOST" 'gpg --import-ownertrust --batch' 2>&1 <"$_TRUST_FILE")"; then
+    mlog ERROR "Unable to import $_TRUST_FILE on $_HOST"
+    return 28
+  fi
+  [[ -n "$out" ]] && mlog VERBOSE "=-=-= Import Ownertrust Output =-=-=\n$out"
+
+  mlog VERBOSE "Validating $_UID is found in gpg store on $_HOST"
+  if ! out="$(ssh "$_HOST" 'gpg -K --with-subkey-fingerprint "'$_UID'"')"; then
+    mlog ERROR "Unable to find $_UID in gpg db stores on _$HOST"
+    return 29
+  fi
+
+  mlog SUCCESS "Successfully imported $_UID into $_HOST's gpg store"
+  [[ -n "$out" ]] && mlog SUCCESS "=-=-= Key Material =-=-=\n$out"
+}
+
+function sync {
+  echo "NOT DONE"
+
+}
+
+function backup {
+  if [ -z "$1" ]; then
+    mlog ERROR "backup requires <key>"
+    return 1
+  fi
+  keyid=$1
+  shift
+
+  declare keyid_reg="^[A-Za-z\@\.]+$"
+  if ! [[ "$keyid" =~ $keyid_reg ]]; then
+    mlog ERROR "Invalid key ($keyid)"
+    return 10
+  fi
+
+  declare otrust key
+  key="${keyid}-backup-$(LOGTFMT).gpg"
+  otrust="${keyid}-otrust-$(LOGTFMT).gpg"
+
+  mlog VERBOSE "Exporting Key material for $keyid"
+  if ! out="$(gpg --output "${key}" --export-secret-key --export-options export-backup --armor "$keyid")"; then
+    mlog ERROR "Unable to create backup for $keyid"
+    [[ -n "$out" ]] && mlog ERROR "$out"
+    return 11
+  fi
+  mlog SUCCESS "Successfully created $keyid key material backup ($key)."
+
+  mlog VERBOSE "Exporting Trust Store"
+  if ! out="$(gpg --export-ownertrust >"${otrust}")"; then
+    mlog ERROR "Unable to create owership trust backup for $keyid"
+    [[ -n "$out" ]] && mlog ERROR "$out"
+    return 12
+  fi
+  mlog SUCCESS "Successfully created trust store backup ($otrust)."
+}
+
+function import {
+  if [[ -z "$1" || ! -e "$1" ]]; then
+    mlog ERROR "import requires <key file>"
+    return 31
+  fi
+
+  mlog VERBOSE "Importing key $1 into local store "
+  if ! out="$(gpg --import "$1")"; then
+    mlog ERROR "Unable to import $1"
+    return 32
+  fi
+  shift
+}
+
+function import-otrust {
+  if [[ -z "$1" || ! -e "$1" ]]; then
+    mlog ERROR "import otrust requires <otrust file>"
+    return 35
+  fi
+
+  mlog VERBOSE "Importing ownership trust $1 into trustdb"
+  if ! out="$(gpg --import-ownertrust "$1")"; then
+    mlog ERROR "Unable to import ownership trust $1 into trustdb"
+    return 36
+  fi
+  shift
+}
+
+function scrub {
+  if [ -z "$1" ]; then
+    mlog ERROR "scrub requries at least a <key> with optiona of remote host"
+    return 40
+  fi
+  declare _KEY=$1
+  shift
+  declare _HOST=${1:-''} && shift
+
+  if [ -n "$_HOST" ]; then
+    mlog VERBOSE "Validating connectivity to $_HOST"
+    if ! [[ "$(ssh-keyscan -4T 2 "$_HOST" 2>&1)" =~ $_HOST ]]; then
+      mlog ERROR "Validation of connectivity to $_HOST failed"
+      return 41
+    fi
+    mlog VERBOSE "Validation of connectivity to $_HOST successfull"
+
+    mlog VERBOSE "Determining key fingerprint for $_KEY on $_HOST"
+    if ! out="$(ssh $_HOST 'gpg --with-colons -K --with-fingerprint --with-fingerprint "'$_KEY'"' 2>&1)"; then
+      mlog ERROR "Unable to determine a fingerprint for $_KEY on $_HOST"
+      return 42
+    fi
+    declare _FPR=''
+    _FPR="$(echo "$out" | awk -F: '$1=="fpr" { printf $(NF-1); exit; }')"
+    mlog VERBOSE "Determined ${_KEY}'s key fingerprint is $_FPR on $_HOST"
+
+    # shellcheck disable=SC2086
+    if $TEST; then
+      mlog TEST "Would of ran: ssh $_HOST 'gpg --batch --yes --delete--secret-keys \"'$_FPR'\"'"
+    else
+      mlog VERBOSE "Deleting secret key with $_FPR fingerprint on $_HOST"
+      if ! out=$(ssh $_HOST 'gpg --batch --yes --delete-secret-keys "'$_FPR'"' 2>&1); then
+        mlog ERROR "Failed to delete the $_KEY using $_FPR fingerprint on $_HOST"
+        [[ -n "$out" ]] && mlog ERROR "$out"
+      fi
+      mlog SUCCESS "Successfully deleted secrey key $_KEY with fingerprint of $_FPR on $_HOST"
+    fi
+
+    # shellcheck disable=SC2086
+    if $TEST; then
+      mlog TEST "Would of ran: ssh $_HOST 'gpg --batch --yes --delete-keys \"'$_FPR'\"'"
+    else
+      mlog VERBOSE "Deleting public key with $_FPR fingerprint on $_HOST"
+      if ! out=$(ssh $_HOST 'gpg --batch --yes --delete-keys "'$_FPR'"' 2>&1); then
+        mlog ERROR "Failed to delete the $_KEY using $_FPR fingerprint on $_HOST"
+        [[ -n "$out" ]] && mlog ERROR "$out"
+      fi
+      mlog SUCCESS "Successfully deleted public key $_KEY with fingerprint of $_FPR on $_HOST"
+    fi
+  else
+    mlog VERBOSE "Determining key fingerprint for $_KEY"
+    if ! out="$(gpg --with-colons -K --with-fingerprint --with-fingerprint "$_KEY" 2>&1)"; then
+      mlog ERROR "Unable to determine a key fingerprint for $_KEY"
+      return 42
+    fi
+    declare _FPR=''
+    _FPR="$(echo "$out" | awk -F: '$1=="fpr" { printf $(NF-1); exit; }')"
+    mlog VERBOSE "Determined ${_KEY}'s key fingerprint is $_FPR"
+
+    mlog VERBOSE "Deleting secret key with $_FPR fingerprint"
+    # shellcheck disable=SC2086
+    if ! out=$(gpg --batch --yes --delete-secret-keys $_FPR 2>&1); then
+      mlog ERROR "Failed to delete the secret $_KEY key using $_FPR fingerprint"
+      [[ -n "$out" ]] && mlog ERROR "$out"
+    fi
+    mlog SUCCESS "Successfully deleted secret key $_KEY with fingerprint of $_FPR"
+
+    mlog VERBOSE "Deleting public key with $_FPR fingerprint"
+    # shellcheck disable=SC2086
+    if ! out=$(gpg --batch --yes --delete-secret-keys $_FPR 2>&1); then
+      mlog ERROR "Failed to delete the $_KEY using $_FPR fingerprint"
+      [[ -n "$out" ]] && mlog ERROR "$out"
+    fi
+    mlog SUCCESS "Successfully deleted public key $_KEY with fingerprint of $_FPR"
+  fi
+}
+
+function list-keys {
+  if ! out=$(gpg --list-secret-keys 2>&1); then
+    mlog ERROR "Failed to fetch keys from GnuGPG"
+    [[ -n "$out" ]] && mlog ERROR "$out"
+  fi
+  mlog "$out"
+
+}
+
+function remote-version {
+  if [[ -z "$1" ]]; then
+    mlog ERROR "remote-version requires a host argument"
+    return 40
+  fi
+
+  declare _HOST='' out=''
+
+  while [[ $# -gt 0 ]]; do
+    _HOST="$1"
+    shift
+    mlog VERBOSE "Validating connectivity to $_HOST"
+    if ! [[ "$(ssh-keyscan -4T 2 "$_HOST" 2>&1)" =~ $_HOST ]]; then
+      mlog ERROR "Validation of connectivity to $_HOST failed"
+      return 41
+    fi
+
+    if ! out=$(ssh "$_HOST" 'for x in $(type -a gpg | cut -d" " -f3) ; do echo -n '"$_HOST"':$x: ; $x --version | head -1 ; done'); then
+      mlog ERROR "Unable to determine GPG version from $_HOST"
+    else
+      if [ -n "$out" ]; then
+        mlog SUCCESS "$out"
+      else
+        mlog ERROR "$_HOST:gpg not installed"
+      fi
+    fi
+  done
+}
+
+function help {
+  echo '
+Usage: fgpg [global option] command [command option]
+Options:
+  -d,--debug      : Enable debug logging
+  -v,--verbose    : Enable verbose logging
+  -s,--short      : Utilize short keyid format
+  -l,--long       : Utilize long keyid format
+
+Commands:
+  list (host)                                   : List keys on host (if host not given localhost used)
+  update-default-key <key>                      : Update default key in gpg.conf
+  cleanup                                       : Cleanup gpg (remove expired keys)
+  sync-backup <key file> <otrust file> <host>   : Utilizing backup files to import to remote key store"
+  sync <key> <otrust> <host>                    : On the fly sync of key to host
+  backup <key>                                  : Backup key and store info in <out>
+  import <key file>                             : Import <key>
+  import-otrust <otrust file>                   : Import ownership trust"
+  scrub <key> (host)                            : Scrub <key> from local store or from (host)"
+  remote-version <host> ..                      : Determine remote gpg version (ideally 2.4.x for Auth keys)"
+'
+
+  if [ -n "$1" ] && [[ "$1" =~ ^[0-9]+ ]] && [ "$1" -ge 0 ] && [ "$1" -le 255 ]; then
+    exit "$1"
+  fi
+}
+
+#####################################
+# Main Section
+#####################################
+
+if ! nullify gpg --version; then
+  mlog ERROR "gpg is not install or not in search path" 1
+fi
+
+if [[ $# -lt 1 ]]; then
+  mlog ERROR "$APPNAME requires a command"
+  help 2
+fi
+
+# following are internal to get arguments section
+declare _EOPT='' _ARG='' x=''
+declare -a _ARGV=() _POS=()
+
+while [[ $# -gt 0 ]]; do
+  _ARG="$1"
+  shift
+  case "${_EOPT}${_ARG}" in
+  --)
+    ARGV+=("$_ARG")
+    _EOPT=1
+    ;;
+  --*=*) ARGV+=("${_ARG%%=*}" "${_ARG#*=}") ;;
+  --*) ARGV+=("$_ARG") ;;
+  -*)
+    for x in $(seq 2 ${#_ARG}); do ARGV+=("-${_ARG:$x-1:1}"); done
+    unset x
+    ;;
+  *) ARGV+=("$_ARG") ;;
+  esac
+done
+
+_EOPT=''
+set -- "${ARGV[@]}"
+while [[ $# -gt 0 ]]; do
+  _ARG="$1"
+  shift
+  case "${_EOPT}${_ARG}" in
+  -h | --help) help 0 ;;
+  -v | --verbose)
+    # shellcheck disable=SC2034
+    VERBOSE=true
+    mlog VERBOSE "Logging Enabled"
+    ;;
+  -d | --debug)
+    # shellcheck disable=SC2034
+    DEBUG=true
+    mlog DEBUG "Logging Enabled"
+    ;;
+  -l | --long)
+    KEYFORMAT="LONG"
+    ;;
+  -s | --short)
+    KEYFORMAT="SHORT"
+    ;;
+  -t | --test)
+    TEST=true
+    mlog TEST "Logging Enabled"
+    ;;
+  import) import $@ ;;
+  import-otrust) import-otrust $@ ;;
+  backup) backup $@ ;;
+  update-default-key) update-default-key $@ ;;
+  scrub) scrub $@ ;;
+  cleanup) cleanup $@ ;;
+  sync-backup) sync-backup $@ ;;
+  sync) sync $@ ;;
+  list) list-keys $@ ;;
+  remote-version) remote-version $@ ;;
+  --) _EOPT=1 ;;
+  -*) mlog ERROR "$_ARG is an invalid option" 1 ;;
+  *) POS+=("$_ARG") ;;
+  esac
+done
+
+exit 0
