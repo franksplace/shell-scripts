@@ -14,19 +14,16 @@
 #See the License for the specific language governing permissions and
 #limitations under the License.
 #
-import subprocess, getopt, sys
+import subprocess, re, sys, inspect
 from datetime import datetime
 
 #############################
 # Declaration Section
 #############################
-DEBUG = False
-VERBOSE = False
-DATALOG = False
-COLORS = True
+#
 
 #############################
-# Function Section
+# Class Section
 #############################
 class Colors:
     """ ANSI color codes - see see https://en.wikipedia.org/wiki/ANSI_escape_code#Colors """
@@ -87,10 +84,46 @@ class Colors:
             kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
             del kernel32
 
-def mlog(msg_type, msg_string = None, exit_code = None, datelog = DATALOG , colors = COLORS):
+#############################
+# Module Section
+#############################
+def bcheck(var):
+    caller_globals = dict(inspect.getmembers(inspect.stack()[1][0]))["f_globals"]
+    try:
+        if caller_globals[var]:
+            return True
+    except KeyError:
+        return False
+
+    return False
+
+
+def mlog(msg_type, msg_string = None, exit_code = None, datelog = None, colors = None ):
+    caller_globals = dict(inspect.getmembers(inspect.stack()[1][0]))["f_globals"]
+    if datelog is None:
+        try:
+            if caller_globals['DATELOG']:
+                datelog = caller_globals['DATELOG']
+        except KeyError:
+            datelog = False
+
+    if colors is None:
+        try:
+            if caller_globals['COLORS']:
+                colors = caller_globals['COLORS']
+        except KeyError:
+            colors = False
+
     if not msg_string:
         msg_string = msg_type
         msg_type = ''
+
+    if re.search("TEST|DEBUG|VERBOSE", msg_type):
+        try:
+            if not caller_globals[msg_type]:
+                return
+        except KeyError:
+            return
 
     if datelog:
         prefix = datetime.now(tz=datetime.now().astimezone().tzinfo).strftime('%Y-%m-%dT%H:%M:%S.%f%z')
