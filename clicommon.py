@@ -141,7 +141,11 @@ def mlog(msg_type, msg_string = None, exit_code = None, datelog = None, colors =
         out=msg_string
 
     if colors:
-        print(getattr(Colors,msg_type) + out + Colors.END)
+        if msg_type:
+            print(getattr(Colors,msg_type) + f"msg_type is {msg_type} " + out + Colors.END)
+        else:
+            print(Colors.END + f"msg_type is {msg_type} " + out + Colors.END)
+
     else:
         print(out)
 
