@@ -18,11 +18,6 @@ import subprocess, re, sys, inspect
 from datetime import datetime
 
 #############################
-# Declaration Section
-#############################
-#
-
-#############################
 # Class Section
 #############################
 class Colors:
