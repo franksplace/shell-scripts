@@ -9,6 +9,3 @@ Common functions that are used accross SH, Bash, & ZSH scripts
 
 Common functions that are used with Python
 
-## General Scripts
-
-* fgpg - script to manage GnuPG directory and local keys
